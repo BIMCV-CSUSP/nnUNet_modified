@@ -1,6 +1,7 @@
 import torch
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
+from nnunetv2.training.loss.focal_loss import FocalLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
 
@@ -153,4 +154,138 @@ class DC_and_topk_loss(nn.Module):
             if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        return result
+
+
+class SigmoidFocalLoss(nn.BCEWithLogitsLoss):
+
+    def __init__(
+        self,
+        alpha: float = 0.25,
+        gamma: float = 2,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__(reduction="none")
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor):
+        p = torch.sigmoid(inputs)
+        ce_loss = super().forward(inputs, targets)
+        p_t = p * targets + (1 - p) * (1 - targets)
+        loss = ce_loss * ((1 - p_t) ** self.gamma)
+
+        if self.alpha >= 0:
+            alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+            loss = alpha_t * loss
+        if self.reduction == "none":
+            pass
+        elif self.reduction == "mean":
+            loss = loss.mean()
+        elif self.reduction == "sum":
+            loss = loss.sum()
+        else:
+            raise ValueError(
+                f"Invalid Value for arg 'reduction': '{reduction} \n Supported reduction modes: 'none', 'mean', 'sum'"
+            )
+        return loss
+
+
+class DC_and_Focal_loss(nn.Module):
+    def __init__(
+        self,
+        focal_kwargs,
+        soft_dice_kwargs,
+        weight_ce=1,
+        weight_dice=1,
+        use_ignore_label: bool = False,
+        dice_class=MemoryEfficientSoftDiceLoss,
+    ):
+        """
+        DO NOT APPLY NONLINEARITY IN YOUR NETWORK!
+
+        target mut be one hot encoded
+        IMPORTANT: We assume use_ignore_label is located in target[:, -1]!!!
+
+        :param soft_dice_kwargs:
+        :param focal_kwargs:
+        :param aggregate:
+        """
+        super(DC_and_Focal_loss, self).__init__()
+        if use_ignore_label:
+            focal_kwargs["reduction"] = "none"
+
+        self.weight_dice = weight_dice
+        self.weight_ce = weight_ce
+        self.use_ignore_label = use_ignore_label
+
+        self.ce = SigmoidFocalLoss(**focal_kwargs)
+        self.dc = dice_class(apply_nonlin=torch.sigmoid, **soft_dice_kwargs)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        if self.use_ignore_label:
+            # target is one hot encoded here. invert it so that it is True wherever we can compute the loss
+            mask = (1 - target[:, -1:]).bool()
+            # remove ignore channel now that we have the mask
+            target_regions = torch.clone(target[:, :-1])
+        else:
+            target_regions = target
+            mask = None
+
+        dc_loss = self.dc(net_output, target_regions, loss_mask=mask)
+        if mask is not None:
+            ce_loss = (self.ce(net_output, target_regions) * mask).sum() / torch.clip(
+                mask.sum(), min=1e-8
+            )
+        else:
+            ce_loss = self.ce(net_output, target_regions)
+        result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
+        return result
+
+class FL_and_CE_loss(nn.Module):
+    def __init__(self, fl_kwargs=None, ce_kwargs=None, alpha=0.5, aggregate="sum"):
+        super(FL_and_CE_loss, self).__init__()
+        if fl_kwargs is None:
+            fl_kwargs = {}
+        if ce_kwargs is None:
+            ce_kwargs = {}
+
+        self.aggregate = aggregate
+        self.fl = FocalLoss(apply_nonlin=nn.Softmax(), **fl_kwargs)
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.alpha = alpha
+
+    def forward(self, net_output, target):
+        fl_loss = self.fl(net_output, target)
+        ce_loss = self.ce(net_output, target)
+        if self.aggregate == "sum":
+            result = self.alpha*fl_loss + (1-self.alpha)*ce_loss
+        else:
+            raise NotImplementedError("nah son")
+        return result
+    
+class FL_and_CE_and_DC_loss(nn.Module):
+    def __init__(self, soft_dice_kwargs, fl_kwargs=None, ce_kwargs=None, alpha=0.5, aggregate="sum", weight_dice=1, dice_class=SoftDiceLoss):
+        super(FL_and_CE_and_DC_loss, self).__init__()
+        if fl_kwargs is None:
+            fl_kwargs = {}
+        if ce_kwargs is None:
+            ce_kwargs = {}
+        
+        self.weight_dice = weight_dice
+        self.aggregate = aggregate
+        self.fl = FocalLoss(apply_nonlin=nn.Softmax(), **fl_kwargs)
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.dc = dice_class(apply_nonlin=softmax_helper_dim1, **soft_dice_kwargs)
+        self.alpha = alpha
+
+    def forward(self, net_output, target):
+        fl_loss = self.fl(net_output, target)
+        ce_loss = self.ce(net_output, target)
+        dc_loss = self.dc(net_output, target, loss_mask=None)
+        if self.aggregate == "sum":
+            result = self.alpha*fl_loss + (1-self.alpha)*ce_loss + self.weight_dice * dc_loss
+        else:
+            raise NotImplementedError("nah son")
         return result
